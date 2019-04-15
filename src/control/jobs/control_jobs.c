@@ -251,14 +251,14 @@ typedef struct dt_control_merge_hdr_t
   uint32_t first_filter;
   uint8_t first_xtrans[6][6];
 
-  float *pixels, *weight;
+  float *pixels;
 
   int wd;
   int ht;
   dt_image_orientation_t orientation;
 
-  float whitelevel;
-  float epsw;
+  float minscale;
+  float maxscale;
 
   // 0 - ok; 1 - errors, abort
   gboolean abort;
@@ -285,26 +285,6 @@ static const char *dt_control_merge_hdr_mime(dt_imageio_module_data_t *data)
   return "memory";
 }
 
-static float envelope(const float xx)
-{
-  const float x = CLAMPS(xx, 0.0f, 1.0f);
-  // const float alpha = 2.0f;
-  const float beta = 0.5f;
-  if(x < beta)
-  {
-    // return 1.0f-fabsf(x/beta-1.0f)^2
-    const float tmp = fabsf(x / beta - 1.0f);
-    return 1.0f - tmp * tmp;
-  }
-  else
-  {
-    const float tmp1 = (1.0f - x) / (1.0f - beta);
-    const float tmp2 = tmp1 * tmp1;
-    const float tmp3 = tmp2 * tmp1;
-    return 3.0f * tmp2 - 2.0f * tmp3;
-  }
-}
-
 static int dt_control_merge_hdr_process(dt_imageio_module_data_t *datai, const char *filename,
                                         const void *const ivoid,
                                         dt_colorspaces_color_profile_type_t over_type, const char *over_filename,
@@ -318,6 +298,13 @@ static int dt_control_merge_hdr_process(dt_imageio_module_data_t *datai, const c
   const dt_image_t *img = dt_image_cache_get(darktable.image_cache, imgid, 'r');
   const dt_image_t image = *img;
   dt_image_cache_read_release(darktable.image_cache, img);
+
+  if(image.buf_dsc.filters == 0u || image.buf_dsc.channels != 1 || image.buf_dsc.datatype != TYPE_UINT16)
+  {
+    dt_control_log(_("exposure bracketing only works on raw images."));
+    d->abort = TRUE;
+    return 1;
+  }
 
   if(!d->pixels)
   {
@@ -333,20 +320,18 @@ static int dt_control_merge_hdr_process(dt_imageio_module_data_t *datai, const c
     roi.y = image.crop_y;
     for(int j=0;j<6;j++)
       for(int i = 0; i < 6; i++) d->first_xtrans[j][i] = FCxtrans(j, i, &roi, image.buf_dsc.xtrans);
-    d->pixels = calloc(datai->width * datai->height, sizeof(float));
-    d->weight = calloc(datai->width * datai->height, sizeof(float));
+    d->pixels = malloc(datai->width * datai->height * sizeof(float));
+    memcpy(d->pixels, ivoid, datai->width * datai->height * sizeof(float));
+
     d->wd = datai->width;
     d->ht = datai->height;
     d->orientation = image.orientation;
+    d->minscale = 1.0f;
+    d->maxscale = 1.0f;
+    return 0;
   }
 
-  if(image.buf_dsc.filters == 0u || image.buf_dsc.channels != 1 || image.buf_dsc.datatype != TYPE_UINT16)
-  {
-    dt_control_log(_("exposure bracketing only works on raw images."));
-    d->abort = TRUE;
-    return 1;
-  }
-  else if(datai->width != d->wd || datai->height != d->ht || d->first_filter != image.buf_dsc.filters
+  if(datai->width != d->wd || datai->height != d->ht || d->first_filter != image.buf_dsc.filters
           || d->orientation != image.orientation)
   {
     dt_control_log(_("images have to be of same size and orientation!"));
@@ -354,82 +339,59 @@ static int dt_control_merge_hdr_process(dt_imageio_module_data_t *datai, const c
     return 1;
   }
 
-  // if no valid exif data can be found, assume peleng fisheye at f/16, 8mm, with half of the light lost in
-  // the system => f/22
-  const float eap = image.exif_aperture > 0.0f ? image.exif_aperture : 22.0f;
-  const float efl = image.exif_focal_length > 0.0f ? image.exif_focal_length : 8.0f;
-  const float rad = .5f * efl / eap;
-  const float aperture = M_PI * rad * rad;
-  const float iso = image.exif_iso > 0.0f ? image.exif_iso : 100.0f;
-  const float exp = image.exif_exposure > 0.0f ? image.exif_exposure : 1.0f;
-  const float cal = 100.0f / (aperture * exp * iso);
-  // about proportional to how many photons we can expect from this shot:
-  const float photoncnt = 100.0f * aperture * exp / iso;
-  float saturation = 1.0f;
-  d->whitelevel = fmaxf(d->whitelevel, saturation * cal);
+  float* const pixels = d->pixels;
+  const float* const input = (float*) ivoid;
+
+  float sum_reference = 0.0f;
+  float sum_current = 0.0f;
+  const size_t n = (size_t)d->wd * d->ht;
+  const float gamma = 2.2f;
+
 #ifdef _OPENMP
-#pragma omp parallel for schedule(static) default(none) shared(d, saturation)
+#pragma omp parallel for SIMD() schedule(static) reduction(+:sum_reference, sum_current)
 #endif
-  for(int y = 0; y < d->ht; y++)
-    for(int x = 0; x < d->wd; x++)
-    {
-      // read unclamped raw value with subtracted black and rescaled to 1.0 saturation.
-      // this is the output of the rawprepare iop.
-      const float in = ((float *)ivoid)[x + d->wd * y];
-      // weights based on siggraph 12 poster
-      // zijian zhu, zhengguo li, susanto rahardja, pasi fraenti
-      // 2d denoising factor for high dynamic range imaging
-      float w = photoncnt;
+  for(size_t i = 0; i < n; ++i)
+  {
+    const float reference = pixels[i];
+    const float current = input[i];
 
-      // need some safety margin due to upsampling and 16-bit quantization + dithering?
-      float offset = 3000.0f / (float)UINT16_MAX;
-
-      // cannot do an envelope based on single pixel values here, need to get
-      // maximum value of all color channels. to find that, go through the
-      // pattern block (we conservatively do a 3x3 for bayer or xtrans):
-      int xx = x & ~1, yy = y & ~1;
-      float M = 0.0f, m = FLT_MAX;
-      if(xx < d->wd - 2 && yy < d->ht - 2)
-      {
-        for(int i = 0; i < 3; i++)
-          for(int j = 0; j < 3; j++)
-          {
-            M = MAX(M, ((float *)ivoid)[xx + i + d->wd * (yy + j)]);
-            m = MIN(m, ((float *)ivoid)[xx + i + d->wd * (yy + j)]);
-          }
-        // move envelope a little to allow non-zero weight even for clipped regions.
-        // this is because even if the 2x2 block is clipped somewhere, the other channels
-        // might still prove useful. we'll check for individual channel saturation below.
-        w *= d->epsw + envelope((M + offset) / saturation);
-      }
-
-      if(M + offset >= saturation)
-      {
-        if(d->weight[x + d->wd * y] <= 0.0f)
-        { // only consider saturated pixels in case we have nothing better:
-          if(d->weight[x + d->wd * y] == 0 || m < -d->weight[x + d->wd * y])
-          {
-            if(m + offset >= saturation)
-              d->pixels[x + d->wd * y] = 1.0f; // let's admit we were completely clipped, too
-            else
-              d->pixels[x + d->wd * y] = in * cal / d->whitelevel;
-            d->weight[x + d->wd * y]
-                = -m; // could use -cal here, but m is per pixel and safer for varying illumination conditions
-          }
-        }
-        // else silently ignore, others have filled in a better color here already
-      }
-      else
-      {
-        if(d->weight[x + d->wd * y] <= 0.0)
-        { // cleanup potentially blown highlights from earlier images
-          d->pixels[x + d->wd * y] = 0.0f;
-          d->weight[x + d->wd * y] = 0.0f;
-        }
-        d->pixels[x + d->wd * y] += w * in * cal;
-        d->weight[x + d->wd * y] += w;
-      }
+    const float vmin = powf(0.1f, gamma);
+    const float vmax = powf(0.9f, gamma);
+    if (reference >= vmin && reference <= vmax && current >= vmin && current <= vmax) {
+      sum_reference += reference;
+      sum_current += current;
     }
+  }
+
+  if (sum_reference == 0.0f || sum_current == 0.0f) {
+    dt_control_log(_("could not find any pixels to compare exposures"));
+    d->abort = TRUE;
+    return 1;
+  }
+
+  const float scale = sum_reference / sum_current;
+  d->minscale = MIN(d->minscale, scale);
+  d->maxscale = MAX(d->maxscale, scale);
+
+  const float minscale = d->minscale;
+  const float maxscale = d->maxscale;
+#ifdef _OPENMP
+#pragma omp parallel for SIMD() schedule(static)
+#endif
+  for(size_t i = 0; i < n; ++i)
+  {
+    const float in = powf(input[i], 1.0f / gamma);
+    const float blend = 0.2f;
+    const float eps = 1e-6f;
+    float weight;
+    if (scale == minscale)
+      weight = MIN((1.0f - in) / blend + eps, 1.0f);
+    else if (scale == maxscale)
+      weight = MIN(in / blend + eps, 1.0f);
+    else
+      weight = MIN(MIN(in, 1.0f - in) / blend + eps, 1.0f);
+    pixels[i] = (1.0f - weight) * pixels[i] + weight * input[i] * scale;
+  }
 
   return 0;
 }
@@ -445,7 +407,7 @@ static int32_t dt_control_merge_hdr_job_run(dt_job_t *job)
 
   dt_control_job_set_progress_message(job, message);
 
-  dt_control_merge_hdr_t d = (dt_control_merge_hdr_t){.epsw = 1e-8f, .abort = FALSE };
+  dt_control_merge_hdr_t d = (dt_control_merge_hdr_t){ .abort = FALSE };
 
   dt_imageio_module_format_t buf = (dt_imageio_module_format_t){.mime = dt_control_merge_hdr_mime,
                                                                 .levels = dt_control_merge_hdr_levels,
@@ -476,16 +438,6 @@ static int32_t dt_control_merge_hdr_job_run(dt_job_t *job)
 
   if(d.abort) goto end;
 
-// normalize by white level to make clipping at 1.0 work as expected
-
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static) default(none) shared(d)
-#endif
-  for(size_t k = 0; k < (size_t)d.wd * d.ht; k++)
-  {
-    if(d.weight[k] > 0.0) d.pixels[k] = fmaxf(0.0f, d.pixels[k] / (d.whitelevel * d.weight[k]));
-  }
-
   // output hdr as digital negative with exif data.
   uint8_t *exif = NULL;
   char pathname[PATH_MAX] = { 0 };
@@ -514,7 +466,6 @@ static int32_t dt_control_merge_hdr_job_run(dt_job_t *job)
 
 end:
   free(d.pixels);
-  free(d.weight);
 
   dt_control_queue_redraw_center();
   return 0;
